@@ -6,33 +6,67 @@ import os
 import speech_recognition as sr
 import whisper
 import torch
+import obsws_python as obs
 
 from datetime import datetime, timedelta
 from queue import Queue
 from tempfile import NamedTemporaryFile
 from time import sleep
 from sys import platform
+from deep_translator import MicrosoftTranslator
 
+msftkey = None
+obscl = None
+
+
+
+def translate(text, fromlang, tolang):
+    result = "Needs translation"
+    
+    microsoftTranslator = MicrosoftTranslator(api_key=msftkey, source=fromlang, target=tolang, region='southcentralus')
+    try:
+        result = microsoftTranslator.translate(f"""{text}""")
+    except Exception as e:
+        result = text + f" (Translation failed - {e})"
+    return result
+
+def sendCaption(text):
+    try:
+        obscl.send_stream_caption(text)
+    except Exception as e:
+        print(f"OBS request failed: {e}")
+    pass
 
 def main():
+    global msftkey
+    global obspass
+    global obsserver
+    global obscl
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="medium", help="Model to use",
                         choices=["tiny", "base", "small", "medium", "large"])
-    parser.add_argument("--non_english", action='store_true',
-                        help="Don't use the english model.")
+    parser.add_argument("--english_only", action='store_true',
+                        help="Use the english model.")
     parser.add_argument("--energy_threshold", default=1000,
                         help="Energy level for mic to detect.", type=int)
     parser.add_argument("--record_timeout", default=2,
                         help="How real time the recording is in seconds.", type=float)
     parser.add_argument("--phrase_timeout", default=3,
                         help="How much empty space between recordings before we "
-                             "consider it a new line in the transcription.", type=float)  
-    if 'linux' in platform:
-        parser.add_argument("--default_microphone", default='pulse',
-                            help="Default microphone name for SpeechRecognition. "
-                                 "Run this with 'list' to view available Microphones.", type=str)
+                             "consider it a new line in the transcription.", type=float)
+    parser.add_argument('--obs-server', default='localhost:4455')
+    parser.add_argument('--obs-pass')
+    parser.add_argument('--msft-apikey')
+    parser.add_argument("--default_microphone", default='pulse',
+                        help="Default microphone name for SpeechRecognition. "
+                           "Run this with 'list' to view available Microphones.", type=str)
+    # To get both myself and discord involved, have to listen to my mic onto VAC1, have discord output to VAC2 (and listen to VAC2 on actual audio output), and use a VAC Repeater to send VAC2 to VAC1
     args = parser.parse_args()
-    
+    obspass     = args.obs_pass
+    obsserver   = args.obs_server
+    if obspass:
+        obscl = obs.ReqClient(host=obsserver.split(':')[0], port=obsserver.split(':')[1], password=obspass)
+    msftkey     = args.msft_apikey
     # The last time a recording was retreived from the queue.
     phrase_time = None
     # Current raw audio bytes.
@@ -47,24 +81,24 @@ def main():
     
     # Important for linux users. 
     # Prevents permanent application hang and crash by using the wrong Microphone
-    if 'linux' in platform:
-        mic_name = args.default_microphone
-        if not mic_name or mic_name == 'list':
-            print("Available microphone devices are: ")
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                print(f"Microphone with name \"{name}\" found")   
-            return
-        else:
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                if mic_name in name:
-                    source = sr.Microphone(sample_rate=16000, device_index=index)
-                    break
-    else:
+    mic_name = args.default_microphone
+    if mic_name == 'list':
+        print("Available microphone devices are: ")
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            print(f"Microphone with name \"{name}\" found")   
+        return
+    elif not mic_name:
         source = sr.Microphone(sample_rate=16000)
+    else:
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            if mic_name in name:
+                source = sr.Microphone(sample_rate=16000, device_index=index)
+                break
+
         
     # Load / Download model
     model = args.model
-    if args.model != "large" and not args.non_english:
+    if args.model != "large" and args.english_only:
         model = model + ".en"
     audio_model = whisper.load_model(model)
 
@@ -92,7 +126,8 @@ def main():
 
     # Cue the user that we're ready to go.
     print("Model loaded.\n")
-
+    print(torch.cuda.is_available())
+    print(torch.version.cuda)
     while True:
         try:
             now = datetime.utcnow()
@@ -123,11 +158,18 @@ def main():
                 # Read the transcription.
                 result = audio_model.transcribe(temp_file, fp16=torch.cuda.is_available())
                 text = result['text'].strip()
-
+                translated = text
+                if result['language'] == 'en':
+                    translated = translate(text, result['language'], 'es')
+                else:
+                    translated = translate(text, result['language'], 'en')
+                text = translated
                 # If we detected a pause between recordings, add a new item to our transcripion.
                 # Otherwise edit the existing one.
                 if phrase_complete:
                     transcription.append(text)
+                    if obscl:
+                        sendCaption(text)
                 else:
                     transcription[-1] = text
 
@@ -143,7 +185,7 @@ def main():
         except KeyboardInterrupt:
             break
 
-    print("\n\nTranscription:")
+    print("\n\nOriginal Transcription:")
     for line in transcription:
         print(line)
 
